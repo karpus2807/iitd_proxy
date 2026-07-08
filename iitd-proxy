@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IIT Delhi proxy setup helper for Ubuntu 16.04 through 24.04.
+IIT Delhi proxy setup helper for Ubuntu 16.04 through 26.04.
 
 This script intentionally keeps dependencies minimal. It configures the proxy
 for Ubuntu's system tools, installs only mandatory missing packages, and skips
@@ -12,6 +12,7 @@ import getpass
 import json
 import os
 import platform
+import pwd
 import shutil
 import socket
 import ssl
@@ -30,6 +31,14 @@ PREFIX_MAP = {
     "mtech": 62,
     "btech": 22,
     "staff": 78,
+    "faculty": 82,
+    "visitor": 21,
+}
+
+LOGIN_URL_MAP = {
+    "staff": "https://proxy21.iitd.ac.in/cgi-bin/proxy.cgi",
+    "faculty": "https://proxy82.iitd.ac.in/cgi-bin/proxy.cgi",
+    "visitor": "https://proxy21.iitd.ac.in/cgi-bin/proxy.cgi",
 }
 
 PROXY_PORT = 3128
@@ -82,15 +91,28 @@ def log(message):
 
 def run(cmd, check=True, timeout=None, env=None):
     log("+ " + " ".join(cmd))
-    completed = subprocess.run(
-        cmd,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
-        env=env,
-    )
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        log(f"  timed out after {timeout} seconds")
+        if output.strip():
+            for line in output.rstrip().splitlines():
+                log("  " + line)
+        if check:
+            raise ProxyError(f"Command timed out after {timeout} seconds: {' '.join(cmd)}") from exc
+        return subprocess.CompletedProcess(cmd, 124, stdout=output)
+
     if completed.stdout.strip():
         for line in completed.stdout.rstrip().splitlines():
             log("  " + line)
@@ -122,9 +144,9 @@ def detect_ubuntu():
     if distro_id and distro_id != "ubuntu":
         log(f"Warning: detected {distro_id}, but this script is designed for Ubuntu.")
 
-    supported = {"16.04", "18.04", "20.04", "22.04", "24.04"}
+    supported = {"16.04", "18.04", "20.04", "22.04", "24.04", "26.04"}
     if version_id and version_id not in supported:
-        log(f"Warning: Ubuntu {version_id} is not in the tested range 16.04-24.04.")
+        log(f"Warning: Ubuntu {version_id} is not in the tested range 16.04-26.04.")
 
     return {
         "id": distro_id or platform.system(),
@@ -133,9 +155,9 @@ def detect_ubuntu():
     }
 
 
-def get_login_url(prefix):
-    if prefix == 78:
-        return "https://proxy21.iitd.ac.in/cgi-bin/proxy.cgi"
+def get_login_url(role, prefix):
+    if role in LOGIN_URL_MAP:
+        return LOGIN_URL_MAP[role]
     return f"https://proxy{prefix}.iitd.ac.in/cgi-bin/proxy.cgi"
 
 
@@ -165,8 +187,76 @@ def proxy_env(prefix):
     return env
 
 
-def direct_https_opener():
-    sslctx = ssl.create_default_context()
+def target_user_record():
+    user = os.environ.get("SUDO_USER")
+    if not user or user == "root":
+        return None
+    try:
+        return pwd.getpwnam(user)
+    except KeyError:
+        return None
+
+
+def managed_block(content):
+    return (
+        "# >>> iitd-proxy managed >>>\n"
+        + content.rstrip()
+        + "\n# <<< iitd-proxy managed <<<\n"
+    )
+
+
+def replace_managed_block(path, content):
+    marker_start = "# >>> iitd-proxy managed >>>"
+    marker_end = "# <<< iitd-proxy managed <<<"
+    new_block = managed_block(content)
+
+    if path.exists():
+        existing = path.read_text(encoding="utf-8", errors="ignore")
+        start = existing.find(marker_start)
+        end = existing.find(marker_end)
+        if start != -1 and end != -1:
+            end += len(marker_end)
+            existing = existing[:start].rstrip() + "\n\n" + existing[end:].lstrip()
+        final = existing.rstrip() + "\n\n" + new_block
+    else:
+        final = new_block
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(final, encoding="utf-8")
+
+
+def remove_managed_block(path):
+    marker_start = "# >>> iitd-proxy managed >>>"
+    marker_end = "# <<< iitd-proxy managed <<<"
+    if not path.exists():
+        return
+
+    existing = path.read_text(encoding="utf-8", errors="ignore")
+    start = existing.find(marker_start)
+    end = existing.find(marker_end)
+    if start == -1 or end == -1:
+        return
+
+    end += len(marker_end)
+    cleaned = (existing[:start].rstrip() + "\n" + existing[end:].lstrip()).strip()
+    path.write_text((cleaned + "\n") if cleaned else "", encoding="utf-8")
+    log(f"Removed managed proxy block from {path}")
+
+
+def chown_to_user(path, user_info):
+    try:
+        os.chown(path, user_info.pw_uid, user_info.pw_gid)
+    except OSError as exc:
+        log(f"Could not change owner for {path}: {exc}")
+
+
+def direct_https_opener(verify_tls=True):
+    if verify_tls:
+        sslctx = ssl.create_default_context()
+    else:
+        # IITD proxy login servers may present a chain missing from fresh Ubuntu
+        # trust stores. This fallback is limited to the IITD login request only.
+        sslctx = ssl._create_unverified_context()
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=sslctx),
@@ -174,17 +264,26 @@ def direct_https_opener():
     return opener
 
 
-def login(prefix, user, password):
-    base = get_login_url(prefix)
+def is_certificate_error(exc):
+    text = str(exc).lower()
+    return "certificate_verify_failed" in text or "certificate verify failed" in text
+
+
+def login(role, prefix, user, password):
+    base = get_login_url(role, prefix)
     opener = direct_https_opener()
 
     try:
         html = opener.open(base, timeout=20).read().decode("utf-8", errors="replace")
-    except ssl.SSLError as exc:
-        raise ProxyError(
-            "TLS verification failed while opening IITD proxy login page. "
-            "Install/fix ca-certificates and retry."
-        ) from exc
+    except (ssl.SSLError, urllib.error.URLError) as exc:
+        if not is_certificate_error(exc):
+            raise ProxyError(f"Could not reach IITD proxy login page: {exc}") from exc
+        log("IITD proxy login TLS verification failed; retrying login with IITD-only TLS fallback.")
+        opener = direct_https_opener(verify_tls=False)
+        try:
+            html = opener.open(base, timeout=20).read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, socket.timeout) as retry_exc:
+            raise ProxyError(f"Could not reach IITD proxy login page: {retry_exc}") from retry_exc
     except (urllib.error.URLError, socket.timeout) as exc:
         raise ProxyError(f"Could not reach IITD proxy login page: {exc}") from exc
 
@@ -302,8 +401,17 @@ def configure_snap(prefix):
         return "SKIPPED"
 
     url = proxy_url(prefix).rstrip("/")
-    run(["snap", "set", "system", f"proxy.http={url}", f"proxy.https={url}"], check=False, timeout=30)
-    log("Snap proxy configured.")
+    result = run(["snap", "set", "system", f"proxy.http={url}", f"proxy.https={url}"], check=False, timeout=30)
+    if result.returncode != 0:
+        log("Snap proxy could not be configured.")
+        return "CHECK"
+
+    if shutil.which("systemctl"):
+        # snapd is a daemon; restarting makes proxy changes take effect faster
+        # after LAN/WLAN switches and avoids stale store connections.
+        run(["systemctl", "restart", "snapd.service"], check=False, timeout=20)
+
+    log("Snap proxy configured and snapd refreshed.")
     return "OK"
 
 
@@ -321,11 +429,43 @@ def configure_gsettings(prefix):
     host = proxy_host(prefix)
     env = os.environ.copy()
     env["DISPLAY"] = display
+    target_uid = None
     dbus = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
-    if dbus:
-        env["DBUS_SESSION_BUS_ADDRESS"] = dbus
+    if not dbus:
+        try:
+            target_uid = pwd.getpwnam(target_user).pw_uid
+            user_bus = Path(f"/run/user/{target_uid}/bus")
+            if user_bus.exists():
+                dbus = f"unix:path={user_bus}"
+        except KeyError:
+            dbus = None
+    elif target_uid is None:
+        try:
+            target_uid = pwd.getpwnam(target_user).pw_uid
+        except KeyError:
+            target_uid = None
 
-    base = ["sudo", "-u", target_user]
+    if not dbus:
+        log("GNOME gsettings: desktop DBus session not found, skipping.")
+        return "SKIPPED"
+    if target_uid is None:
+        log("GNOME gsettings: desktop user not found, skipping.")
+        return "SKIPPED"
+
+    env["DBUS_SESSION_BUS_ADDRESS"] = dbus
+
+    base = [
+        "sudo",
+        "-u",
+        target_user,
+        "env",
+        f"DISPLAY={display}",
+        f"DBUS_SESSION_BUS_ADDRESS={dbus}",
+        f"XDG_RUNTIME_DIR=/run/user/{target_uid}",
+    ]
+    current_mode = run(base + ["gsettings", "get", "org.gnome.system.proxy", "mode"], check=False, timeout=10, env=env)
+    if current_mode.returncode == 0:
+        log(f"Current Ubuntu desktop proxy mode: {current_mode.stdout.strip() or 'unknown'}")
     commands = [
         base + ["gsettings", "set", "org.gnome.system.proxy", "mode", "manual"],
         base + ["gsettings", "set", "org.gnome.system.proxy.http", "host", host],
@@ -336,11 +476,138 @@ def configure_gsettings(prefix):
         base + ["gsettings", "set", "org.gnome.system.proxy.ftp", "port", str(PROXY_PORT)],
         base + ["gsettings", "set", "org.gnome.system.proxy", "ignore-hosts", "['localhost', '127.0.0.1', '::1']"],
     ]
+    failed = False
     for command in commands:
-        run(command, check=False, timeout=10, env=env)
+        result = run(command, check=False, timeout=10, env=env)
+        output = result.stdout.lower()
+        if result.returncode != 0 or "failed to commit changes" in output:
+            failed = True
 
-    log("GNOME desktop proxy configured for current user session.")
+    if failed:
+        log("GNOME desktop proxy could not be fully applied. System-wide proxy is still configured.")
+        return "CHECK"
+
+    log("Ubuntu desktop proxy enabled in manual mode for current user session.")
     return "OK"
+
+
+def configure_cursor_settings(prefix, user_info):
+    home = Path(user_info.pw_dir)
+    settings_path = home / ".config" / "Cursor" / "User" / "settings.json"
+    if not settings_path.parent.exists():
+        log("Cursor settings directory not found, skipping Cursor app proxy.")
+        return "SKIPPED"
+
+    settings = {}
+    if settings_path.exists() and settings_path.stat().st_size > 0:
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            log(f"Cursor settings file is not valid JSON, skipping: {settings_path}")
+            return "CHECK"
+
+    settings["http.proxy"] = proxy_url(prefix).rstrip("/")
+    settings["http.proxySupport"] = "override"
+    settings_path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    chown_to_user(settings_path, user_info)
+    log(f"Cursor app proxy configured in {settings_path}. Restart Cursor to apply it.")
+    return "OK"
+
+
+def configure_user_app_proxy(prefix):
+    user_info = target_user_record()
+    if not user_info:
+        log("User app proxy: no sudo desktop user detected, skipping.")
+        return "SKIPPED"
+
+    url = proxy_url(prefix)
+    home = Path(user_info.pw_dir)
+    env_dir = home / ".config" / "environment.d"
+    env_file = env_dir / "95-iitd-proxy.conf"
+    env_content = "\n".join(
+        [
+            f"http_proxy={url}",
+            f"https_proxy={url}",
+            f"ftp_proxy={url}",
+            f"HTTP_PROXY={url}",
+            f"HTTPS_PROXY={url}",
+            f"FTP_PROXY={url}",
+            f"no_proxy={NO_PROXY}",
+            f"NO_PROXY={NO_PROXY}",
+        ]
+    )
+    env_dir.mkdir(parents=True, exist_ok=True)
+    env_file.write_text(env_content + "\n", encoding="utf-8")
+    os.chown(env_dir, user_info.pw_uid, user_info.pw_gid)
+    chown_to_user(env_file, user_info)
+    log(f"User environment proxy configured in {env_file}")
+
+    wgetrc = home / ".wgetrc"
+    replace_managed_block(
+        wgetrc,
+        "\n".join(
+            [
+                "use_proxy = on",
+                f"http_proxy = {url}",
+                f"https_proxy = {url}",
+                f"ftp_proxy = {url}",
+                f"no_proxy = {NO_PROXY}",
+            ]
+        ),
+    )
+    chown_to_user(wgetrc, user_info)
+    log(f"wget proxy configured in {wgetrc}")
+
+    curlrc = home / ".curlrc"
+    replace_managed_block(
+        curlrc,
+        "\n".join(
+            [
+                f'proxy = "{url}"',
+                f'noproxy = "{NO_PROXY}"',
+            ]
+        ),
+    )
+    chown_to_user(curlrc, user_info)
+    log(f"curl proxy configured in {curlrc}")
+
+    uid = user_info.pw_uid
+    runtime_dir = f"/run/user/{uid}"
+    dbus = f"unix:path={runtime_dir}/bus"
+    runtime_env = proxy_env(prefix)
+    runtime_env.update(
+        {
+            "DISPLAY": os.environ.get("DISPLAY", ":0"),
+            "DBUS_SESSION_BUS_ADDRESS": dbus,
+            "XDG_RUNTIME_DIR": runtime_dir,
+        }
+    )
+
+    if Path(runtime_dir, "bus").exists():
+        keys = [
+            "http_proxy",
+            "https_proxy",
+            "ftp_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "FTP_PROXY",
+            "no_proxy",
+            "NO_PROXY",
+        ]
+        run(["sudo", "-u", user_info.pw_name, "systemctl", "--user", "import-environment"] + keys, check=False, timeout=15, env=runtime_env)
+        if shutil.which("dbus-update-activation-environment"):
+            run(
+                ["sudo", "-u", user_info.pw_name, "dbus-update-activation-environment", "--systemd"] + keys,
+                check=False,
+                timeout=15,
+                env=runtime_env,
+            )
+    else:
+        log("User runtime DBus session not found; GUI apps may need logout/login.")
+
+    cursor_status = configure_cursor_settings(prefix, user_info)
+    log("Restart already-open GUI apps, including Cursor, to use the new proxy.")
+    return "OK" if cursor_status in {"OK", "SKIPPED"} else "CHECK"
 
 
 def package_installed(package):
@@ -455,15 +722,117 @@ def remove_gsettings_proxy():
     if not shutil.which("gsettings"):
         return "SKIPPED"
 
-    target_user = os.environ.get("SUDO_USER")
-    if not target_user:
+    user_info = target_user_record()
+    if not user_info:
         return "SKIPPED"
 
-    run(
-        ["sudo", "-u", target_user, "gsettings", "set", "org.gnome.system.proxy", "mode", "none"],
-        check=False,
-        timeout=10,
+    runtime_dir = f"/run/user/{user_info.pw_uid}"
+    env = os.environ.copy()
+    env.update(
+        {
+            "DISPLAY": os.environ.get("DISPLAY", ":0"),
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_dir}/bus",
+            "XDG_RUNTIME_DIR": runtime_dir,
+        }
     )
+
+    base = [
+        "sudo",
+        "-u",
+        user_info.pw_name,
+        "env",
+        f"DISPLAY={env['DISPLAY']}",
+        f"DBUS_SESSION_BUS_ADDRESS={env['DBUS_SESSION_BUS_ADDRESS']}",
+        f"XDG_RUNTIME_DIR={runtime_dir}",
+    ]
+    commands = [
+        base + ["gsettings", "set", "org.gnome.system.proxy", "mode", "none"],
+        base + ["gsettings", "set", "org.gnome.system.proxy.http", "host", ""],
+        base + ["gsettings", "set", "org.gnome.system.proxy.http", "port", "0"],
+        base + ["gsettings", "set", "org.gnome.system.proxy.https", "host", ""],
+        base + ["gsettings", "set", "org.gnome.system.proxy.https", "port", "0"],
+        base + ["gsettings", "set", "org.gnome.system.proxy.ftp", "host", ""],
+        base + ["gsettings", "set", "org.gnome.system.proxy.ftp", "port", "0"],
+    ]
+    failed = False
+    for command in commands:
+        result = run(command, check=False, timeout=10, env=env)
+        if result.returncode != 0 or "failed to commit changes" in result.stdout.lower():
+            failed = True
+
+    if failed:
+        log("Ubuntu desktop proxy could not be fully disabled.")
+        return "CHECK"
+
+    log("Ubuntu desktop proxy disabled.")
+    return "OK"
+
+
+def looks_like_iitd_proxy(value):
+    if not isinstance(value, str):
+        return False
+    parsed = urllib.parse.urlparse(value)
+    return parsed.scheme in {"http", "https"} and parsed.hostname and parsed.hostname.startswith("10.10.") and parsed.port == PROXY_PORT
+
+
+def clear_user_runtime_proxy(user_info):
+    runtime_dir = f"/run/user/{user_info.pw_uid}"
+    if not Path(runtime_dir, "bus").exists():
+        return
+
+    keys = [
+        "http_proxy",
+        "https_proxy",
+        "ftp_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "FTP_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ]
+    env = os.environ.copy()
+    env.update(
+        {
+            "DISPLAY": os.environ.get("DISPLAY", ":0"),
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_dir}/bus",
+            "XDG_RUNTIME_DIR": runtime_dir,
+        }
+    )
+    run(["sudo", "-u", user_info.pw_name, "systemctl", "--user", "unset-environment"] + keys, check=False, timeout=15, env=env)
+    log("Cleared proxy variables from running user systemd session.")
+
+
+def remove_user_app_proxy():
+    user_info = target_user_record()
+    if not user_info:
+        return "SKIPPED"
+
+    home = Path(user_info.pw_dir)
+    remove_path(home / ".config" / "environment.d" / "95-iitd-proxy.conf")
+    remove_managed_block(home / ".wgetrc")
+    remove_managed_block(home / ".curlrc")
+    clear_user_runtime_proxy(user_info)
+
+    state = load_state()
+    expected_proxy = None
+    if state.get("proxy_host") and state.get("proxy_port"):
+        expected_proxy = f"http://{state['proxy_host']}:{state['proxy_port']}"
+
+    cursor_settings = home / ".config" / "Cursor" / "User" / "settings.json"
+    if cursor_settings.exists():
+        try:
+            settings = json.loads(cursor_settings.read_text(encoding="utf-8"))
+            cursor_proxy = settings.get("http.proxy")
+            if cursor_proxy == expected_proxy or looks_like_iitd_proxy(cursor_proxy):
+                settings.pop("http.proxy", None)
+                if settings.get("http.proxySupport") == "override":
+                    settings.pop("http.proxySupport", None)
+                cursor_settings.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                chown_to_user(cursor_settings, user_info)
+                log(f"Removed Cursor app proxy from {cursor_settings}")
+        except json.JSONDecodeError:
+            log(f"Could not parse Cursor settings during remove: {cursor_settings}")
+
     return "OK"
 
 
@@ -476,6 +845,7 @@ def remove_proxy():
     remove_environment_entries()
     snap_status = remove_snap_proxy()
     gnome_status = remove_gsettings_proxy()
+    user_app_status = remove_user_app_proxy()
 
     if shutil.which("systemctl"):
         run(["systemctl", "daemon-reexec"], check=False, timeout=15)
@@ -486,6 +856,7 @@ def remove_proxy():
     log("Remove complete.")
     log(f"Snap: {snap_status}")
     log(f"GNOME: {gnome_status}")
+    log(f"User apps: {user_app_status}")
 
 
 def test_python_proxy(prefix):
@@ -497,16 +868,24 @@ def test_python_proxy(prefix):
             }
         )
     )
-    req = urllib.request.Request(
+    urls = [
+        "http://archive.ubuntu.com/ubuntu/",
+        "http://security.ubuntu.com/ubuntu/",
         "http://connectivity-check.ubuntu.com/",
-        headers={"User-Agent": "iitd-proxy/1.0"},
-    )
-    try:
-        with opener.open(req, timeout=20) as response:
-            return 200 <= response.status < 400
-    except Exception as exc:  # noqa: BLE001 - report verification failure without aborting setup.
-        log(f"Python proxy test failed: {exc}")
-        return False
+    ]
+
+    last_error = None
+    for url in urls:
+        req = urllib.request.Request(url, headers={"User-Agent": "iitd-proxy/1.0"})
+        try:
+            with opener.open(req, timeout=15) as response:
+                if 200 <= response.status < 500:
+                    return True
+        except Exception as exc:  # noqa: BLE001 - verification should report and continue.
+            last_error = exc
+
+    log(f"Python proxy test failed: {last_error}")
+    return False
 
 
 def verify_apt_config():
@@ -520,7 +899,15 @@ def verify_snap_config():
     if not shutil.which("snap"):
         return "SKIPPED"
     result = run(["snap", "get", "system", "proxy.http"], check=False, timeout=20)
-    return "OK" if result.returncode == 0 and "http://" in result.stdout else "CHECK"
+    if result.returncode != 0 or "http://" not in result.stdout:
+        return "CHECK"
+
+    connectivity = run(["snap", "debug", "connectivity"], check=False, timeout=60)
+    if connectivity.returncode != 0:
+        log("Snap connectivity check failed. Try after reconnecting LAN and rerunning setup.")
+        return "CHECK"
+
+    return "OK"
 
 
 def run_full_apt_test(prefix):
@@ -568,18 +955,20 @@ def install_proxy(args):
     log(f"Proxy endpoint: {proxy_url(prefix)}")
 
     log("Logging in to IITD proxy...")
-    login(prefix, args.userid, args.password)
+    login(args.role, prefix, args.userid, args.password)
 
     configure_apt(prefix)
     configure_environment(prefix)
     configure_systemd(prefix)
     snap_status = configure_snap(prefix)
     gnome_status = configure_gsettings(prefix)
+    user_app_status = configure_user_app_proxy(prefix)
     installed_packages = install_missing_mandatory_packages(prefix)
     save_state(prefix, ubuntu, installed_packages)
 
     log(f"Snap setup: {snap_status}")
     log(f"GNOME setup: {gnome_status}")
+    log(f"User app setup: {user_app_status}")
     verification_report(prefix, ubuntu, full_test=args.full_test)
 
 
@@ -591,10 +980,12 @@ def normalize_legacy_args(argv):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Configure IITD proxy system-wide on Ubuntu 16.04 through 24.04.",
+        description="Configure IITD proxy system-wide on Ubuntu 16.04 through 26.04.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   sudo ./iitd-proxy install btech USERID
+  sudo ./iitd-proxy install faculty USERID
+  sudo ./iitd-proxy install visitor USERID
   sudo ./iitd-proxy install mtech USERID PASSWORD --full-test
   sudo ./iitd-proxy remove
 
