@@ -250,6 +250,16 @@ def chown_to_user(path, user_info):
         log(f"Could not change owner for {path}: {exc}")
 
 
+def ensure_user_dir(path, user_info):
+    path.mkdir(parents=True, exist_ok=True)
+    current = path
+    while current != Path(user_info.pw_dir).parent and str(current).startswith(user_info.pw_dir):
+        chown_to_user(current, user_info)
+        if current == Path(user_info.pw_dir):
+            break
+        current = current.parent
+
+
 def direct_https_opener(verify_tls=True):
     if verify_tls:
         sslctx = ssl.create_default_context()
@@ -494,9 +504,7 @@ def configure_gsettings(prefix):
 def configure_cursor_settings(prefix, user_info):
     home = Path(user_info.pw_dir)
     settings_path = home / ".config" / "Cursor" / "User" / "settings.json"
-    if not settings_path.parent.exists():
-        log("Cursor settings directory not found, skipping Cursor app proxy.")
-        return "SKIPPED"
+    ensure_user_dir(settings_path.parent, user_info)
 
     settings = {}
     if settings_path.exists() and settings_path.stat().st_size > 0:
@@ -511,6 +519,61 @@ def configure_cursor_settings(prefix, user_info):
     settings_path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     chown_to_user(settings_path, user_info)
     log(f"Cursor app proxy configured in {settings_path}. Restart Cursor to apply it.")
+    return "OK"
+
+
+def cursor_env_exec(prefix, original_exec):
+    url = proxy_url(prefix).rstrip("/")
+    env_parts = [
+        f"http_proxy={url}",
+        f"https_proxy={url}",
+        f"HTTP_PROXY={url}",
+        f"HTTPS_PROXY={url}",
+        f"no_proxy={NO_PROXY}",
+        f"NO_PROXY={NO_PROXY}",
+    ]
+    command = original_exec[len("Exec="):].strip()
+    cursor_binary = "/usr/share/cursor/cursor"
+    proxy_flags = f'{cursor_binary} --proxy-server={url} "--proxy-bypass-list=localhost;127.0.0.1;::1"'
+    if command.startswith(cursor_binary):
+        command = proxy_flags + command[len(cursor_binary):]
+    return "Exec=env " + " ".join(env_parts) + " " + command
+
+
+def configure_cursor_desktop_entries(prefix, user_info):
+    sources = [
+        Path("/usr/share/applications/cursor.desktop"),
+        Path("/usr/share/applications/cursor-url-handler.desktop"),
+    ]
+    target_dir = Path(user_info.pw_dir) / ".local" / "share" / "applications"
+    ensure_user_dir(target_dir, user_info)
+
+    configured = False
+    for source in sources:
+        if not source.exists():
+            continue
+
+        lines = source.read_text(encoding="utf-8", errors="ignore").splitlines()
+        updated = []
+        for line in lines:
+            if line.startswith("Exec=/usr/share/cursor/cursor"):
+                updated.append(cursor_env_exec(prefix, line))
+            else:
+                updated.append(line)
+
+        target = target_dir / source.name
+        target.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
+        chown_to_user(target, user_info)
+        log(f"Cursor desktop launcher proxy configured in {target}")
+        configured = True
+
+    if not configured:
+        log("Cursor desktop launcher not found, skipping launcher proxy.")
+        return "SKIPPED"
+
+    if shutil.which("update-desktop-database"):
+        run(["sudo", "-u", user_info.pw_name, "update-desktop-database", str(target_dir)], check=False, timeout=20)
+
     return "OK"
 
 
@@ -594,10 +657,27 @@ def configure_user_app_proxy(prefix):
             "no_proxy",
             "NO_PROXY",
         ]
-        run(["sudo", "-u", user_info.pw_name, "systemctl", "--user", "import-environment"] + keys, check=False, timeout=15, env=runtime_env)
+        user_env_command = [
+            "sudo",
+            "-u",
+            user_info.pw_name,
+            "env",
+            f"DISPLAY={runtime_env['DISPLAY']}",
+            f"DBUS_SESSION_BUS_ADDRESS={runtime_env['DBUS_SESSION_BUS_ADDRESS']}",
+            f"XDG_RUNTIME_DIR={runtime_env['XDG_RUNTIME_DIR']}",
+            f"http_proxy={runtime_env['http_proxy']}",
+            f"https_proxy={runtime_env['https_proxy']}",
+            f"ftp_proxy={runtime_env['ftp_proxy']}",
+            f"HTTP_PROXY={runtime_env['HTTP_PROXY']}",
+            f"HTTPS_PROXY={runtime_env['HTTPS_PROXY']}",
+            f"FTP_PROXY={runtime_env['FTP_PROXY']}",
+            f"no_proxy={runtime_env['no_proxy']}",
+            f"NO_PROXY={runtime_env['NO_PROXY']}",
+        ]
+        run(user_env_command + ["systemctl", "--user", "import-environment"] + keys, check=False, timeout=15, env=runtime_env)
         if shutil.which("dbus-update-activation-environment"):
             run(
-                ["sudo", "-u", user_info.pw_name, "dbus-update-activation-environment", "--systemd"] + keys,
+                user_env_command + ["dbus-update-activation-environment", "--systemd"] + keys,
                 check=False,
                 timeout=15,
                 env=runtime_env,
@@ -606,8 +686,9 @@ def configure_user_app_proxy(prefix):
         log("User runtime DBus session not found; GUI apps may need logout/login.")
 
     cursor_status = configure_cursor_settings(prefix, user_info)
+    cursor_launcher_status = configure_cursor_desktop_entries(prefix, user_info)
     log("Restart already-open GUI apps, including Cursor, to use the new proxy.")
-    return "OK" if cursor_status in {"OK", "SKIPPED"} else "CHECK"
+    return "OK" if cursor_status == "OK" and cursor_launcher_status in {"OK", "SKIPPED"} else "CHECK"
 
 
 def package_installed(package):
@@ -832,6 +913,9 @@ def remove_user_app_proxy():
                 log(f"Removed Cursor app proxy from {cursor_settings}")
         except json.JSONDecodeError:
             log(f"Could not parse Cursor settings during remove: {cursor_settings}")
+
+    remove_path(home / ".local" / "share" / "applications" / "cursor.desktop")
+    remove_path(home / ".local" / "share" / "applications" / "cursor-url-handler.desktop")
 
     return "OK"
 

@@ -67,10 +67,18 @@ Login shell proxy
 Systemd proxy
 wget proxy
 curl proxy
-Cursor proxy, if Cursor settings folder exists
+Cursor proxy settings
+Cursor desktop launcher proxy override with --proxy-server, if Cursor is installed
 ```
 
 Ubuntu Settings me proxy `Off` ho to install command usko automatically `Manual` enable karegi.
+Cursor already open ho to completely close karke dobara open karo. App menu se launch karne par script user-local Cursor launcher me proxy environment aur Chromium `--proxy-server` flag add karti hai.
+
+Cursor launcher verify karna ho:
+
+```bash
+rg proxy-server ~/.local/share/applications/cursor.desktop
+```
 
 ## 5. Full Test
 
